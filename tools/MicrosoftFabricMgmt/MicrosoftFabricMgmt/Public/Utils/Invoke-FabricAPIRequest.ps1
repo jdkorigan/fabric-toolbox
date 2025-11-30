@@ -1,33 +1,33 @@
 <#
 .SYNOPSIS
-    Invokes a Microsoft Fabric API request with support for pagination and long-running operations.
+    Sends an HTTP request to a Microsoft Fabric API, supporting pagination and long-running operations.
 
 .DESCRIPTION
-    This function handles HTTP requests to Microsoft Fabric APIs, including pagination via continuation tokens and long-running operations (LROs). It supports various HTTP methods and processes responses based on status codes.
+    This function executes HTTP requests against Microsoft Fabric APIs. It handles pagination using continuation tokens and manages long-running operations (LROs) when required. Supports multiple HTTP methods and processes responses based on status codes.
 
 .PARAMETER Headers
-    Hashtable containing HTTP headers required for the API request.
+    Hashtable of HTTP headers to include in the request.
 
 .PARAMETER BaseURI
-    The base URI endpoint for the API request.
+    The base URI for the API endpoint.
 
 .PARAMETER Method
-    HTTP method to use for the request. Allowed values: Get, Post, Delete, Put, Patch.
+    The HTTP method to use. Valid values: Get, Post, Delete, Put, Patch.
 
 .PARAMETER Body
-    Optional request body for methods that support payloads (Post, Put, Patch).
+    Optional request body for applicable HTTP methods (Post, Put, Patch).
 
 .PARAMETER ContentType
-    Content type of the request body. Defaults to "application/json; charset=utf-8".
+    The content type of the request body. Default is "application/json; charset=utf-8".
 
 .PARAMETER WaitForCompletion
-    Indicates whether to wait for completion of long-running operations. Defaults to $true.
-
-.PARAMETER HasResults
-    Indicates whether the operation is expected to return results. Defaults to $true.
+    If specified, waits for completion of long-running operations before returning.
 
 .EXAMPLE
-    Invoke-FabricAPIRequest -Headers $headers -BaseURI "https://api.fabric.microsoft.com/resource" -Method "Get"
+    Invoke-FabricAPIRequest -Headers $headers -BaseURI "https://api.fabric.microsoft.com/resource" -Method Get
+
+.EXAMPLE
+    Invoke-FabricAPIRequest -Headers $headers -BaseURI "https://api.fabric.microsoft.com/resource" -Method Post -Body $body -WaitForCompletion
 
 .NOTES
     Author: Tiago Balabuch
@@ -53,12 +53,8 @@ function Invoke-FabricAPIRequest {
         [string] $ContentType = "application/json; charset=utf-8",
 
         [Parameter(Mandatory = $false)]
-        [bool]$WaitForCompletion = $true,
-
-        [Parameter(Mandatory = $false)]
-        [bool]$HasResults = $true
+        [switch]$WaitForCompletion
     )
-
     try {
         # Initialize continuation token and results collection
         $continuationToken = $null
@@ -106,17 +102,30 @@ function Invoke-FabricAPIRequest {
             switch ($statusCode) {
                 200 {
                     Write-Message -Message "API call succeeded." -Level Debug 
+                    [string]$etag = $responseHeader["ETag"]
+                    
                     if ($response) {
                         # Determine response structure and add data to results
                         $propertyNames = $response.PSObject.Properties.Name
+                        $items = @()
                         switch ($true) {
-                            { $propertyNames -contains 'value' } { $results.AddRange($response.value); break }
-                            { $propertyNames -contains 'accessEntities' } { $results.AddRange($response.accessEntities); break }
-                            { $propertyNames -contains 'domains' } { $results.AddRange($response.domains); break }
-                            { $propertyNames -contains 'publishDetails' } { $results.AddRange($response.publishDetails); break }
-                            { $propertyNames -contains 'definition' } { $results.AddRange($response.definition.parts); break }
-                            { $propertyNames -contains 'data' } { $results.AddRange($response.data); break }
-                            default { $results.Add($response) }
+                            { $propertyNames -contains 'value' } { $items = $response.value; break }
+                            { $propertyNames -contains 'accessEntities' } { $items = $response.accessEntities; break }
+                            { $propertyNames -contains 'domains' } { $items = $response.domains; break }
+                            { $propertyNames -contains 'publishDetails' } { $items = $response.publishDetails; break }
+                            { $propertyNames -contains 'definition' } { $items = $response.definition.parts; break }
+                            { $propertyNames -contains 'data' } { $items = $response.data; break }
+                            default { $items = @($response) }
+                        }
+                        foreach ($item in $items) {
+                            if ($etag) {
+                                # Add ETag property to each item if not already present
+                                if ($item -isnot [PSCustomObject]) {
+                                    $item = [PSCustomObject]$item
+                                }
+                                $item | Add-Member -NotePropertyName 'ETag' -NotePropertyValue $etag -Force
+                            }
+                            $results.Add($item)
                         }
                         # Update continuation token for pagination
                         $continuationToken = $propertyNames -contains 'continuationToken' ? $response.continuationToken : $null
@@ -136,19 +145,20 @@ function Invoke-FabricAPIRequest {
                     [string]$operationId = $responseHeader["x-ms-operation-id"]
                     [string]$location = $responseHeader["Location"]
                     $retryAfter = $responseHeader["Retry-After"]
+                    
 
                     # If the response contains an operation ID or Location header, handle as a long-running operation (LRO)
                     if ($operationId -or $location) {
                         Write-Message -Message "Operation ID: '$operationId', Location: '$location'" -Level Debug
 
                         # If waiting for completion is requested, poll the operation status until completion
-                        if ($waitForCompletion) {
+                        if ($WaitForCompletion.IsPresent) {
                             Write-Message -Message "The operation is running synchronously. Proceeding with long-running operation." -Level Debug
                             $operationStatus = Get-FabricLongRunningOperation -operationId $operationId -location $location
                             Write-Message -Message "Long Running Operation status: $operationStatus" -Level Debug
 
                             # If the operation succeeded and results are expected, fetch the result
-                            if ($operationStatus.status -eq "Succeeded" -and $HasResults) {
+                            if ($operationStatus.status -eq "Succeeded") {
                                 Write-Message -Message "Operation succeeded. Fetching result." -Level Debug
                                 $operationResult = Get-FabricLongRunningOperationResult -operationId $operationId
                                 # Add result data to the results collection, handling 'definition' property if present
@@ -160,10 +170,16 @@ function Invoke-FabricAPIRequest {
                                 }
                                 return , $results.ToArray()
                             }
-
+                            elseif ($operationStatus.status -eq "Completed") {
+                                $results.Add($operationStatus)
+                                return , $results.ToArray()
+                            }
                             # Throw an error if the operation failed
-                            if ($operationStatus.status -eq "Failed") {
+                            elseif ($operationStatus.status -eq "Failed") {
                                 throw "Fabric long-running operation failed. Status: Failed. Details: $($operationStatus | ConvertTo-Json -Depth 10)"
+                            }
+                            else {
+                                throw "Unexpected operation status: $($operationStatus.status). Details: $($operationStatus | ConvertTo-Json -Depth 10)"
                             }
                         }
                         else {
@@ -190,7 +206,7 @@ function Invoke-FabricAPIRequest {
 
             # Throw error for unsuccessful responses
             if ($statusCode -notin 200, 201, 202) {
-                throw "API request failed with status code $statusCode. Error: $errorMsg"
+                throw "API request failed with status code $statusCode. Error: $errorMsg Response: $($response | ConvertTo-Json -Depth 10)"
             }
 
         } while ($null -ne $continuationToken)
